@@ -1,56 +1,53 @@
 <!DOCTYPE html>
 <html lang="zh">
-  <head>
+<head>
     <title>GPU 计算降雨，具有可调地形、土块和植物模拟</title>
     <meta charset="utf-8" />
-    <meta
-      name="viewport"
-      content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0"
-    />
-    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0" />
+    <link rel="stylesheet" href="css/styles.css" />
     <!-- 引入 Ammo.js -->
-    <script src="jsm/libs/ammo.wasm.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ammo.js/0.0.10/ammo.wasm.js"></script>
     <!-- 使用 importmap 指定 three.js 模块路径 -->
     <script type="importmap">
-      {
+    {
         "imports": {
-          "three": "../build/three.module.js",
-          "three/addons/": "./jsm/"
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.min.js",
+            "three/addons/": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/examples/jsm/"
         }
-      }
+    }
     </script>
     <!-- 引入 dat.GUI -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
-  </head>
-  <body>
+</head>
+<body>
     <!-- 顶部标题栏与菜单 -->
     <div id="header">
-      <h1>GPU 计算降雨，具有可调地形、土块和植物模拟</h1>
-      <div class="navbar">
-        <div class="menu">
-          <button>文件</button>
-          <div class="dropdown">
-            <button onclick="newProject()">新建工程</button>
-            <button onclick="chooseDEMData()">选择DEM数据</button>
-          </div>
+        <h1>GPU 计算降雨，具有可调地形、土块和植物模拟</h1>
+        <div class="navbar">
+            <div class="menu">
+                <button>文件</button>
+                <div class="dropdown">
+                    <button onclick="newProject()">新建工程</button>
+                    <button onclick="chooseDEMData()">选择DEM数据</button>
+                </div>
+            </div>
+            <div class="menu">
+                <button>编辑</button>
+                <div class="dropdown">
+                    <button onclick="toggleGUISection('terrain')">地形控件</button>
+                    <button onclick="toggleGUISection('object')">物体控件</button>
+                    <button onclick="toggleGUISection('region')">区域控件</button>
+                    <button onclick="toggleGUISection('plant')">植物控件</button>
+                    <button onclick="toggleGUISection('rain')">降雨控件</button>
+                    <button onclick="toggleGUISection('soil')">土壤参数</button>
+                </div>
+            </div>
         </div>
-        <div class="menu">
-          <button>编辑</button>
-          <div class="dropdown">
-            <button onclick="toggleGUISection('terrain')">地形控件</button>
-            <button onclick="toggleGUISection('object')">物体控件</button>
-            <button onclick="toggleGUISection('region')">区域控件</button>
-            <button onclick="toggleGUISection('plant')">植物控件</button>
-            <button onclick="toggleGUISection('rain')">降雨控件</button>
-            <button onclick="toggleGUISection('soil')">土壤参数</button>
-          </div>
-        </div>
-      </div>
     </div>
     <!-- 区域绘制提示 -->
     <div id="drawMessage">区域绘制中：请按 ENTER 或右键结束绘制</div>
     <!-- 主场景容器 -->
     <div id="container"></div>
-    <script type="module" src="main.js"></script>
-  </body>
+    <script type="module" src="scripts/main.js"></script>
+</body>
 </html>

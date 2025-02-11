@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <title>GPU 计算降雨，具有可调地形、土块和植物模拟</title>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0"
+    />
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: sans-serif;
+      }
+      /* 顶部标题栏和菜单栏（始终显示在最上层） */
+      #header {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 40px;
+        background: rgba(0, 0, 0, 0.8);
+        color: #fff;
+        display: flex;
+        align-items: center;
+        padding: 0 20px;
+        z-index: 10000;
+      }
+      #header h1 {
+        margin: 0;
+        font-size: 18px;
+        flex: 1;
+      }
+      .navbar {
+        display: flex;
+        gap: 20px;
+        align-items: center;
+      }
+      .menu {
+        position: relative;
+      }
+      .menu > button {
+        background: none;
+        border: none;
+        color: #fff;
+        font-size: 16px;
+        cursor: pointer;
+      }
+      /* 子菜单下拉列表 */
+      .dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        background: rgba(50, 50, 50, 0.95);
+        min-width: 150px;
+        display: none;
+        flex-direction: column;
+        z-index: 10001;
+      }
+      .menu:hover .dropdown {
+        display: flex;
+      }
+      .dropdown button {
+        background: none;
+        border: none;
+        color: #fff;
+        padding: 8px 12px;
+        text-align: left;
+        cursor: pointer;
+      }
+      .dropdown button:hover {
+        background: rgba(255, 255, 255, 0.2);
+      }
+      /* 区域绘制提示 */
+      #drawMessage {
+        position: absolute;
+        top: 50px;
+        left: 10px;
+        padding: 6px 10px;
+        background: rgba(0, 0, 0, 0.6);
+        color: #fff;
+        font-size: 16px;
+        border-radius: 4px;
+        display: none;
+        z-index: 10001;
+      }
+      /* 主场景容器 */
+      #container {
+        margin-top: 50px;
+        width: 100%;
+        height: calc(100vh - 50px);
+      }
+      /* dat.GUI 控件区域固定在页面左侧 */
+      .dg.main {
+        position: fixed !important;
+        top: 60px !important;
+        left: 10px !important;
+        opacity: 0.8 !important;
+        background: rgba(255, 255, 255, 0.5) !important;
+        z-index: 100;
+      }
+    </style>
+    <!-- 引入 Ammo.js -->
+    <script src="jsm/libs/ammo.wasm.js"></script>
+    <!-- 使用 importmap 指定 three.js 模块路径 -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "../build/three.module.js",
+          "three/addons/": "./jsm/"
+        }
+      }
+    </script>
+    <!-- 引入 dat.GUI -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
+  </head>
+  <body>
+    <!-- 顶部标题栏与菜单 -->
+    <div id="header">
+      <h1>GPU 计算降雨，具有可调地形、土块和植物模拟</h1>
+      <div class="navbar">
+        <div class="menu">
+          <button>文件</button>
+          <div class="dropdown">
+            <button onclick="newProject()">新建工程</button>
+            <button onclick="chooseDEMData()">选择DEM数据</button>
+          </div>
+        </div>
+        <div class="menu">
+          <button>编辑</button>
+          <div class="dropdown">
+            <button onclick="toggleGUISection('terrain')">地形控件</button>
+            <button onclick="toggleGUISection('object')">物体控件</button>
+            <button onclick="toggleGUISection('region')">区域控件</button>
+            <button onclick="toggleGUISection('plant')">植物控件</button>
+            <button onclick="toggleGUISection('rain')">降雨控件</button>
+            <button onclick="toggleGUISection('soil')">土壤参数</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- 区域绘制提示 -->
+    <div id="drawMessage">区域绘制中：请按 ENTER 或右键结束绘制</div>
+    <!-- 主场景容器 -->
+    <div id="container"></div>
+    <script type="module">
+      import * as THREE from "three";
+      import Stats from "three/addons/libs/stats.module.js";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import parseGeoraster from "https://esm.sh/georaster@1.6.0";
+
+      // ---------- DEM 与地形全局参数 ----------
+      let terrainWidthExtents = 100;
+      let terrainDepthExtents = 100;
+      let terrainWidth = 128, terrainDepth = 128;
+      let terrainHalfWidth = terrainWidth / 2, terrainHalfDepth = terrainDepth / 2;
+      let terrainMaxHeight = 8, terrainMinHeight = -2;
+
+      // ---------- 全局变量 ----------
+      let container, stats;
+      let camera, scene, renderer;
+      let terrainMesh;
+      const clock = new THREE.Clock();
+      let collisionConfiguration, dispatcher, broadphase, solver, physicsWorld;
+      let transformAux1;
+      let terrainBody;
+      const dynamicObjects = []; // 包含物体、植物等
+      let heightData = null;
+      let ammoHeightData = null;
+
+      // ---------- 物体生成参数 ----------
+      let time = 0;
+      const objectTimePeriod = 3;
+      let timeNextSpawn = time + objectTimePeriod;
+      let maxNumObjects = 30;
+
+      // ---------- 控制面板参数 ----------
+      const terrainControls = { scale: 0.1, color: "#c2f09a" };
+      const objectParams = { type: "Random", count: 30, size: 0.12, color: "#ff0000", cohesion: 1.0 };
+      // ---------- 植物控件参数 ----------
+      const plantParams = { count: 12, color: "#228833", size: 1.0, height: 4.0, weight: 5 };
+      // ---------- 区域控件数据 ----------
+      let regions = [];
+      let activeRegion = null;
+      const regionControlData = { activeRegion: "未选择" };
+      let regionLines = [];
+
+      // ---------- 区域绘制变量 ----------
+      let drawingMode = false;
+      let drawnShapeVertices = [];
+      let drawnShapeLine = null;
+
+      // ---------- 工程文件夹及物体数据 ----------
+      window.currentProjectFolder = null;
+      let objectsData = [];
+
+      // ---------- 降雨特效相关变量（使用 Points 模拟） ----------
+      let rainParticles;
+      const rainSettings = { rainSpeed: 1.0, rainCount: 10000, rainSize: 0.5, enabled: true };
+
+      // ---------- 土壤参数 ----------
+      const soilParams = { cohesion: 8, adhesion: 8, porePressure: 8 };
+
+      // ---------- DEM 数据加载函数 ----------
+      async function loadDEMHeightData() {
+        const response = await fetch("/data/jiangwan_dem1.tif");
+        const arrayBuffer = await response.arrayBuffer();
+        const georaster = await parseGeoraster(arrayBuffer);
+        console.log("加载服务器 DEM 成功：", georaster);
+        const demWidth = georaster.width, demHeight = georaster.height;
+        const values = georaster.values[0];
+        let minEl = Infinity, maxEl = -Infinity;
+        for (let r = 0; r < demHeight; r++) {
+          for (let c = 0; c < demWidth; c++) {
+            const v = values[r][c];
+            if (v === georaster.noDataValue) continue;
+            if (v < minEl) minEl = v;
+            if (v > maxEl) maxEl = v;
+          }
+        }
+        const amplitude = 200;
+        const heightDataArray = new Float32Array(demWidth * demHeight);
+        for (let r = 0; r < demHeight; r++) {
+          for (let c = 0; c < demWidth; c++) {
+            const v = values[r][c];
+            let normalized = (v === georaster.noDataValue || maxEl === minEl) ? 0 : (v - minEl) / (maxEl - minEl);
+            heightDataArray[r * demWidth + c] = normalized * amplitude - amplitude / 2;
+          }
+        }
+        return { width: demWidth, height: demHeight, heightData: heightDataArray, minHeight: -amplitude/2, maxHeight: amplitude/2 };
+      }
+
+      // ---------- Ammo.js 初始化 ----------
+      Ammo().then(function(AmmoLib) {
+        Ammo = AmmoLib;
+        init();
+      });
+
+      async function init() {
+        const dem = await loadDEMHeightData();
+        terrainWidth = dem.width;
+        terrainDepth = dem.height;
+        heightData = dem.heightData;
+        terrainMinHeight = dem.minHeight;
+        terrainMaxHeight = dem.maxHeight;
+        terrainHalfWidth = terrainWidth / 2;
+        terrainHalfDepth = terrainDepth / 2;
+
+        initGraphics();
+        initPhysics();
+        createGUI();
+        setupRain();
+      }
+
+      // ---------- 图形初始化 ----------
+      function initGraphics() {
+        container = document.getElementById("container");
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setAnimationLoop(animate);
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        stats = new Stats();
+        stats.domElement.style.position = "fixed";
+        stats.domElement.style.top = "60px";
+        stats.domElement.style.right = "10px";
+        stats.domElement.style.left = "auto";
+        document.body.appendChild(stats.domElement);
+
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.2, 2000);
+        const midIndex = Math.floor(terrainHalfWidth + terrainHalfDepth * terrainWidth);
+        camera.position.y = heightData[midIndex] * terrainControls.scale + 5;
+        camera.position.z = terrainDepthExtents / 2;
+        camera.lookAt(0,0,0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableZoom = true;
+
+        const geometry = new THREE.PlaneGeometry(terrainWidthExtents, terrainDepthExtents, terrainWidth-1, terrainDepth-1);
+        geometry.rotateX(-Math.PI/2);
+        const vertices = geometry.attributes.position.array;
+        for(let i=0, l=heightData.length; i<l; i++){
+          vertices[i*3+1] = heightData[i] * terrainControls.scale;
+        }
+        geometry.computeVertexNormals();
+        const groundMaterial = new THREE.MeshPhongMaterial({ color: terrainControls.color });
+        terrainMesh = new THREE.Mesh(geometry, groundMaterial);
+        terrainMesh.receiveShadow = true;
+        terrainMesh.castShadow = true;
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xbfd1e5);
+        scene.add(terrainMesh);
+
+        const textureLoader = new THREE.TextureLoader();
+        textureLoader.load("textures/grid.png", function(texture){
+          texture.wrapS = THREE.RepeatWrapping;
+          texture.wrapT = THREE.RepeatWrapping;
+          texture.repeat.set(terrainWidth-1, terrainDepth-1);
+          groundMaterial.map = texture;
+          groundMaterial.needsUpdate = true;
+        });
+        // 添加环境光与定向光
+        scene.add(new THREE.AmbientLight(0x222222));
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 2.0);
+        directionalLight.position.set(100,100,50);
+        directionalLight.castShadow = true;
+        const dLight = 200, sLight = dLight * 0.25;
+        directionalLight.shadow.camera.left = -sLight;
+        directionalLight.shadow.camera.right = sLight;
+        directionalLight.shadow.camera.top = sLight;
+        directionalLight.shadow.camera.bottom = -sLight;
+        directionalLight.shadow.camera.near = dLight/30;
+        directionalLight.shadow.camera.far  = dLight;
+        directionalLight.shadow.mapSize.x = 2048;
+        directionalLight.shadow.mapSize.y = 2048;
+        scene.add(directionalLight);
+
+        window.addEventListener("resize", onWindowResize);
+      }
+
+      function onWindowResize() {
+        camera.aspect = window.innerWidth/window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+
+      // ---------- 物理初始化 ----------
+      function initPhysics() {
+        collisionConfiguration = new Ammo.btDefaultCollisionConfiguration();
+        dispatcher = new Ammo.btCollisionDispatcher(collisionConfiguration);
+        broadphase = new Ammo.btDbvtBroadphase();
+        solver = new Ammo.btSequentialImpulseConstraintSolver();
+        physicsWorld = new Ammo.btDiscreteDynamicsWorld(dispatcher, broadphase, solver, collisionConfiguration);
+        physicsWorld.setGravity(new Ammo.btVector3(0,-6,0));
+
+        const groundShape = createTerrainShape();
+        const groundTransform = new Ammo.btTransform();
+        groundTransform.setIdentity();
+        groundTransform.setOrigin(new Ammo.btVector3(0,(terrainMaxHeight+terrainMinHeight)/2,0));
+        const groundMass = 0;
+        const groundLocalInertia = new Ammo.btVector3(0,0,0);
+        const groundMotionState = new Ammo.btDefaultMotionState(groundTransform);
+        const rbInfo = new Ammo.btRigidBodyConstructionInfo(groundMass, groundMotionState, groundShape, groundLocalInertia);
+        terrainBody = new Ammo.btRigidBody(rbInfo);
+        physicsWorld.addRigidBody(terrainBody);
+        transformAux1 = new Ammo.btTransform();
+      }
+
+      // 使用 DEM 数据构造物理地形
+      function createTerrainShape() {
+        ammoHeightData = Ammo._malloc(4 * terrainWidth * terrainDepth);
+        let p2 = 0;
+        for(let i=0; i<heightData.length; i++){
+          Ammo.HEAPF32[(ammoHeightData+p2)>>2] = heightData[i] * terrainControls.scale;
+          p2 += 4;
+        }
+        const heightScale = 1, upAxis = 1, hdt = "PHY_FLOAT", flipQuadEdges = false;
+        const heightFieldShape = new Ammo.btHeightfieldTerrainShape(
+          terrainWidth,
+          terrainDepth,
+          ammoHeightData,
+          heightScale,
+          terrainMinHeight*terrainControls.scale,
+          terrainMaxHeight*terrainControls.scale,
+          upAxis,
+          hdt,
+          flipQuadEdges
+        );
+        const scaleX = terrainWidthExtents/(terrainWidth-1);
+        const scaleZ = terrainDepthExtents/(terrainDepth-1);
+        heightFieldShape.setLocalScaling(new Ammo.btVector3(scaleX,1,scaleZ));
+        heightFieldShape.setMargin(0.05);
+        return heightFieldShape;
+      }
+
+      function updateTerrainGeometry(newScale) {
+        const geometry = terrainMesh.geometry;
+        const vertices = geometry.attributes.position.array;
+        for(let i=0, l=heightData.length; i<l; i++){
+          vertices[i*3+1] = heightData[i] * newScale;
+        }
+        geometry.attributes.position.needsUpdate = true;
+        geometry.computeVertexNormals();
+        updateTerrainPhysics(newScale);
+      }
+
+      function updateTerrainPhysics(newScale) {
+        const newMin = terrainMinHeight * newScale;
+        const newMax = terrainMaxHeight * newScale;
+        if(ammoHeightData) Ammo._free(ammoHeightData);
+        ammoHeightData = Ammo._malloc(4 * terrainWidth * terrainDepth);
+        let p2 = 0;
+        for(let i=0; i<heightData.length; i++){
+          Ammo.HEAPF32[(ammoHeightData+p2)>>2] = heightData[i] * newScale;
+          p2 += 4;
+        }
+        const heightScale = 1, upAxis = 1, hdt = "PHY_FLOAT", flipQuadEdges = false;
+        const newHeightFieldShape = new Ammo.btHeightfieldTerrainShape(
+          terrainWidth,
+          terrainDepth,
+          ammoHeightData,
+          heightScale,
+          newMin,
+          newMax,
+          upAxis,
+          hdt,
+          flipQuadEdges
+        );
+        const scaleX = terrainWidthExtents/(terrainWidth-1);
+        const scaleZ = terrainDepthExtents/(terrainDepth-1);
+        newHeightFieldShape.setLocalScaling(new Ammo.btVector3(scaleX,1,scaleZ));
+        newHeightFieldShape.setMargin(0.05);
+        physicsWorld.removeRigidBody(terrainBody);
+        const groundTransform = new Ammo.btTransform();
+        groundTransform.setIdentity();
+        groundTransform.setOrigin(new Ammo.btVector3(0,(newMax+newMin)/2,0));
+        const groundLocalInertia = new Ammo.btVector3(0,0,0);
+        const groundMotionState = new Ammo.btDefaultMotionState(groundTransform);
+        const rbInfo = new Ammo.btRigidBodyConstructionInfo(0, groundMotionState, newHeightFieldShape, groundLocalInertia);
+        terrainBody = new Ammo.btRigidBody(rbInfo);
+        physicsWorld.addRigidBody(terrainBody);
+      }
+
+      // -------------------- 区域绘制及物体添加 --------------------
+      function startDrawingRegion() {
+        drawnShapeVertices = [];
+        if(drawnShapeLine){ scene.remove(drawnShapeLine); drawnShapeLine = null; }
+        drawingMode = true;
+        window.addEventListener("mousedown", onMouseDownRegion);
+        window.addEventListener("keydown", onKeyDownRegion);
+        window.addEventListener("contextmenu", onRightClickRegion);
+        document.getElementById("drawMessage").style.display = "block";
+      }
+
+      function onMouseDownRegion(event) {
+        event.preventDefault();
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouse = new THREE.Vector2();
+        mouse.x = ((event.clientX - rect.left)/rect.width)*2 - 1;
+        mouse.y = -((event.clientY-rect.top)/rect.height)*2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(terrainMesh);
+        if(intersects.length>0){
+          const point = intersects[0].point;
+          drawnShapeVertices.push(point.clone());
+          updateDrawnShapeLine();
+        }
+      }
+
+      function updateDrawnShapeLine() {
+        if(drawnShapeLine) scene.remove(drawnShapeLine);
+        if(drawnShapeVertices.length<2) return;
+        const points = drawnShapeVertices.concat([drawnShapeVertices[0]]);
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 });
+        drawnShapeLine = new THREE.Line(geometry, material);
+        scene.add(drawnShapeLine);
+      }
+
+      function onKeyDownRegion(event) {
+        if(event.key==="Enter"){ finishDrawingRegion(); event.preventDefault(); }
+      }
+
+      function onRightClickRegion(event) {
+        event.preventDefault();
+        finishDrawingRegion();
+      }
+
+      async function finishDrawingRegion() {
+        drawingMode = false;
+        window.removeEventListener("mousedown", onMouseDownRegion);
+        window.removeEventListener("keydown", onKeyDownRegion);
+        window.removeEventListener("contextmenu", onRightClickRegion);
+        document.getElementById("drawMessage").style.display = "none";
+        if(drawnShapeVertices.length<3){
+          alert("请至少绘制3个点来形成有效区域");
+          return;
+        }
+        const adjustedVertices = drawnShapeVertices.map(v => {
+          const h = sampleTerrainHeight(v.x, v.z);
+          return new THREE.Vector3(v.x, h+0.5, v.z);
+        });
+        if(drawnShapeLine) scene.remove(drawnShapeLine);
+        const linePoints = adjustedVertices.concat([adjustedVertices[0]]);
+        const geometry = new THREE.BufferGeometry().setFromPoints(linePoints);
+        const material = new THREE.LineBasicMaterial({ color: 0xffff00, linewidth: 2 });
+        drawnShapeLine = new THREE.Line(geometry, material);
+        scene.add(drawnShapeLine);
+        const newRegion = {
+          id: regions.length+1,
+          name: "区域"+(regions.length+1),
+          vertices: drawnShapeVertices.map(v => v.clone())
+        };
+        regions.push(newRegion);
+        activeRegion = newRegion;
+        regionControlData.activeRegion = newRegion.name;
+        await saveRegionsData();
+        await loadRegionsData();
+        if(regionController && regionController.__select){
+          const select = regionController.__select;
+          while(select.firstChild){ select.removeChild(select.firstChild); }
+          regions.forEach(r => {
+            const option = document.createElement("option");
+            option.value = r.name;
+            option.textContent = r.name;
+            select.appendChild(option);
+          });
+          regionController.setValue(activeRegion.name);
+        }
+        drawRegions();
+      }
+
+      function drawRegions() {
+        regionLines.forEach(line => scene.remove(line));
+        regionLines = [];
+        regions.forEach(reg => {
+          const pts = reg.vertices.concat([reg.vertices[0]]);
+          const geom = new THREE.BufferGeometry().setFromPoints(pts);
+          const col = (activeRegion && activeRegion.id===reg.id) ? 0x00ff00 : 0xff0000;
+          const mat = new THREE.LineBasicMaterial({ color: col, linewidth: 2 });
+          const line = new THREE.Line(geom, mat);
+          scene.add(line);
+          regionLines.push(line);
+        });
+      }
+
+      function pointInPolygon(x, z, polygon) {
+        let inside = false;
+        for(let i=0,j=polygon.length-1; i<polygon.length; j=i++){
+          const xi = polygon[i].x, zi = polygon[i].z;
+          const xj = polygon[j].x, zj = polygon[j].z;
+          const intersect = ((zi>z)!=(zj>z)) && (x < ((xj-xi)*(z-zi))/(zj-zi)+xi);
+          if(intersect) inside = !inside;
+        }
+        return inside;
+      }
+
+      function sampleTerrainHeight(x, z) {
+        const u = (x+terrainWidthExtents/2)/terrainWidthExtents;
+        const v = (z+terrainDepthExtents/2)/terrainDepthExtents;
+        const col = Math.floor(u*terrainWidth);
+        const row = Math.floor(v*terrainDepth);
+        const index = row*terrainWidth+col;
+        return heightData[index]*terrainControls.scale;
+      }
+
+      function addObjectsRegion() {
+        if(!activeRegion){
+          alert("请先在区域控件中选择激活区域");
+          return;
+        }
+        const poly = activeRegion.vertices;
+        let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+        poly.forEach(v => {
+          if(v.x < minX) minX = v.x;
+          if(v.x > maxX) maxX = v.x;
+          if(v.z < minZ) minZ = v.z;
+          if(v.z > maxZ) maxZ = v.z;
+        });
+        const count = objectParams.count;
+        let objectsAdded = 0, attempts = 0;
+        while(objectsAdded<count && attempts<count*10){
+          attempts++;
+          const rx = minX + Math.random()*(maxX-minX);
+          const rz = minZ + Math.random()*(maxZ-minZ);
+          if(pointInPolygon(rx,rz,poly)){
+            generateObjectAt(rx,rz);
+            objectsAdded++;
+          }
+        }
+        saveObjectsData();
+      }
+
+      function generateObjectAt(x, z) {
+        let type;
+        if(objectParams.type==="Random"){
+          type = Math.ceil(Math.random()*4);
+        } else {
+          if(objectParams.type==="Sphere") type = 1;
+          else if(objectParams.type==="Box") type = 2;
+          else if(objectParams.type==="Cylinder") type = 3;
+          else if(objectParams.type==="Cone") type = 4;
+        }
+        let threeObject = null, shape = null;
+        const baseSize = objectParams.size;
+        const marginObj = 0.05;
+        switch(type){
+          case 1:
+            threeObject = new THREE.Mesh(new THREE.SphereGeometry(baseSize,20,20), createObjectMaterial());
+            shape = new Ammo.btSphereShape(baseSize);
+            shape.setMargin(marginObj);
+            break;
+          case 2:
+            threeObject = new THREE.Mesh(new THREE.BoxGeometry(baseSize,baseSize,baseSize), createObjectMaterial());
+            shape = new Ammo.btBoxShape(new Ammo.btVector3(baseSize*0.5, baseSize*0.5, baseSize*0.5));
+            shape.setMargin(marginObj);
+            break;
+          case 3:
+            threeObject = new THREE.Mesh(new THREE.CylinderGeometry(baseSize,baseSize,baseSize*1.5,20,1), createObjectMaterial());
+            shape = new Ammo.btCylinderShape(new Ammo.btVector3(baseSize, baseSize*0.75, baseSize));
+            shape.setMargin(marginObj);
+            break;
+          case 4:
+            threeObject = new THREE.Mesh(new THREE.ConeGeometry(baseSize,baseSize*1.5,20,2), createObjectMaterial());
+            shape = new Ammo.btConeShape(baseSize, baseSize*1.5);
+            shape.setMargin(marginObj);
+            break;
+          default:
+            threeObject = new THREE.Mesh(new THREE.BoxGeometry(baseSize,baseSize,baseSize), createObjectMaterial());
+            shape = new Ammo.btBoxShape(new Ammo.btVector3(baseSize*0.5, baseSize*0.5, baseSize*0.5));
+            shape.setMargin(marginObj);
+            break;
+        }
+        const y = sampleTerrainHeight(x, z) + baseSize + 1;
+        threeObject.position.set(x, y, z);
+        const mass = baseSize*5;
+        const localInertia = new Ammo.btVector3(0,0,0);
+        shape.calculateLocalInertia(mass, localInertia);
+        const transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin(new Ammo.btVector3(x,y,z));
+        const motionState = new Ammo.btDefaultMotionState(transform);
+        const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, shape, localInertia);
+        const body = new Ammo.btRigidBody(rbInfo);
+        threeObject.userData.physicsBody = body;
+        if(activeRegion){ threeObject.userData.regionId = activeRegion.id; }
+        threeObject.castShadow = true;
+        threeObject.receiveShadow = true;
+        scene.add(threeObject);
+        dynamicObjects.push(threeObject);
+        physicsWorld.addRigidBody(body);
+        const objData = { regionId: activeRegion ? activeRegion.id : null, type: objectParams.type, position: { x: threeObject.position.x, y: threeObject.position.y, z: threeObject.position.z }, size: objectParams.size };
+        objectsData.push(objData);
+      }
+
+      function createObjectMaterial() {
+        return new THREE.MeshPhongMaterial({ color: objectParams.color });
+      }
+
+      function updateCohesionForObjects() {
+        dynamicObjects.forEach(obj => {
+          const body = obj.userData.physicsBody;
+          if(objectParams.cohesion>=0.5){
+            body.setFriction(100);
+            body.setDamping(0.99,0.99);
+          } else {
+            body.setFriction(0.5);
+            body.setDamping(0.1,0.3);
+          }
+        });
+      }
+
+      // 新增：更新土壤参数以控制物体的附着力和凝聚力
+      function updateSoilForObjects() {
+        dynamicObjects.forEach(obj => {
+          const body = obj.userData.physicsBody;
+          const force = (soilParams.cohesion + soilParams.adhesion + soilParams.porePressure) / 3;
+          if(force >= 5) {
+            body.setFriction(100);
+            body.setDamping(0.99,0.99);
+          } else {
+            body.setFriction(0.5);
+            body.setDamping(0.1,0.3);
+          }
+        });
+      }
+
+      // -------------------- 植物控件 --------------------
+      function addPlantsRegion() {
+        if(!activeRegion) {
+          alert("请先在区域控件中选择激活区域");
+          return;
+        }
+        const poly = activeRegion.vertices;
+        let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+        poly.forEach(v => {
+          if(v.x < minX) minX = v.x;
+          if(v.x > maxX) maxX = v.x;
+          if(v.z < minZ) minZ = v.z;
+          if(v.z > maxZ) maxZ = v.z;
+        });
+        const count = plantParams.count;
+        let plantsAdded = 0, attempts = 0;
+        while(plantsAdded < count && attempts < count * 10) {
+          attempts++;
+          const rx = minX + Math.random() * (maxX - minX);
+          const rz = minZ + Math.random() * (maxZ - minZ);
+          if(pointInPolygon(rx, rz, poly)) {
+            generatePlantAt(rx, rz);
+            plantsAdded++;
+          }
+        }
+      }
+
+      // 生成植物（针叶树）物理和视觉组合
+      function generatePlantAt(x, z) {
+        const terrainY = sampleTerrainHeight(x, z);
+        // 定义各部分尺寸
+        const trunkHeight = plantParams.height * 0.4;
+        const crown1Height = plantParams.height * 0.25;
+        const crown2Height = plantParams.height * 0.2;
+        const crown3Height = plantParams.height * 0.15;
+        const trunkRadius = plantParams.size * 0.2;
+        const crown1Radius = plantParams.size * 0.6;
+        const crown2Radius = plantParams.size * 0.5;
+        const crown3Radius = plantParams.size * 0.4;
+
+        // 创建视觉部分：树组
+        const plantGroup = new THREE.Group();
+        // 树干
+        const trunkGeometry = new THREE.CylinderGeometry(trunkRadius, trunkRadius, trunkHeight, 8);
+        const trunkMaterial = new THREE.MeshPhongMaterial({ color: plantParams.color });
+        const trunkMesh = new THREE.Mesh(trunkGeometry, trunkMaterial);
+        trunkMesh.castShadow = true;
+        trunkMesh.receiveShadow = true;
+        trunkMesh.position.y = trunkHeight / 2;
+        plantGroup.add(trunkMesh);
+        // 第一层树冠
+        const crown1Geometry = new THREE.ConeGeometry(crown1Radius, crown1Height, 8);
+        const crownMaterial = new THREE.MeshPhongMaterial({ color: plantParams.color });
+        const crown1Mesh = new THREE.Mesh(crown1Geometry, crownMaterial);
+        crown1Mesh.castShadow = true;
+        crown1Mesh.receiveShadow = true;
+        crown1Mesh.position.y = trunkHeight + crown1Height / 2;
+        plantGroup.add(crown1Mesh);
+        // 第二层树冠
+        const crown2Geometry = new THREE.ConeGeometry(crown2Radius, crown2Height, 8);
+        const crown2Mesh = new THREE.Mesh(crown2Geometry, crownMaterial);
+        crown2Mesh.castShadow = true;
+        crown2Mesh.receiveShadow = true;
+        crown2Mesh.position.y = trunkHeight + crown1Height + crown2Height / 2;
+        plantGroup.add(crown2Mesh);
+        // 第三层树冠
+        const crown3Geometry = new THREE.ConeGeometry(crown3Radius, crown3Height, 8);
+        const crown3Mesh = new THREE.Mesh(crown3Geometry, crownMaterial);
+        crown3Mesh.castShadow = true;
+        crown3Mesh.receiveShadow = true;
+        crown3Mesh.position.y = trunkHeight + crown1Height + crown2Height + crown3Height / 2;
+        plantGroup.add(crown3Mesh);
+
+        // 创建物理复合形状
+        const compoundShape = new Ammo.btCompoundShape();
+        // 树干物理形状
+        let transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin(new Ammo.btVector3(0, trunkHeight/2, 0));
+        const ammoTrunk = new Ammo.btCylinderShape(new Ammo.btVector3(trunkRadius, trunkHeight/2, trunkRadius));
+        compoundShape.addChildShape(transform, ammoTrunk);
+        // 第一层树冠物理形状
+        transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin(new Ammo.btVector3(0, trunkHeight + crown1Height/2, 0));
+        const ammoCrown1 = new Ammo.btConeShape(crown1Radius, crown1Height);
+        compoundShape.addChildShape(transform, ammoCrown1);
+        // 第二层树冠物理形状
+        transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin(new Ammo.btVector3(0, trunkHeight + crown1Height + crown2Height/2, 0));
+        const ammoCrown2 = new Ammo.btConeShape(crown2Radius, crown2Height);
+        compoundShape.addChildShape(transform, ammoCrown2);
+        // 第三层树冠物理形状
+        transform = new Ammo.btTransform();
+        transform.setIdentity();
+        transform.setOrigin(new Ammo.btVector3(0, trunkHeight + crown1Height + crown2Height + crown3Height/2, 0));
+        const ammoCrown3 = new Ammo.btConeShape(crown3Radius, crown3Height);
+        compoundShape.addChildShape(transform, ammoCrown3);
+
+        const mass = plantParams.weight;
+        const localInertia = new Ammo.btVector3(0, 0, 0);
+        compoundShape.calculateLocalInertia(mass, localInertia);
+        const plantTransform = new Ammo.btTransform();
+        plantTransform.setIdentity();
+        // 将植物底部固定在 terrain 表面上
+        plantTransform.setOrigin(new Ammo.btVector3(x, terrainY + plantParams.height/2, z));
+        const motionState = new Ammo.btDefaultMotionState(plantTransform);
+        const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, compoundShape, localInertia);
+        const body = new Ammo.btRigidBody(rbInfo);
+        // 初始时固定直立，设置高摩擦和阻尼
+        body.setFriction(100);
+        body.setDamping(0.99, 0.99);
+        plantGroup.userData.physicsBody = body;
+        plantGroup.position.set(x, terrainY + plantParams.height/2, z);
+        plantGroup.castShadow = true;
+        plantGroup.receiveShadow = true;
+        scene.add(plantGroup);
+        dynamicObjects.push(plantGroup);
+        physicsWorld.addRigidBody(body);
+      }
+
+      // -------------------- 降雨特效（使用 Points 模拟） --------------------
+      function createCircleTexture() {
+        const size = 64;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const context = canvas.getContext('2d');
+        context.clearRect(0, 0, size, size);
+        context.beginPath();
+        context.arc(size/2, size/2, size/2, 0, Math.PI * 2);
+        context.closePath();
+        context.fillStyle = "white";
+        context.fill();
+        return new THREE.CanvasTexture(canvas);
+      }
+
+      function setupRain() {
+        const rainCount = rainSettings.rainCount;
+        const rainGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(rainCount * 3);
+        const velocities = new Float32Array(rainCount * 3);
+        const bbox = new THREE.Box3().setFromObject(terrainMesh);
+        const minX = bbox.min.x, maxX = bbox.max.x;
+        const minZ = bbox.min.z, maxZ = bbox.max.z;
+        for (let i = 0; i < rainCount; i++) {
+          positions[i * 3] = Math.random() * (maxX - minX) + minX;
+          positions[i * 3 + 1] = Math.random() * 50 + 50;
+          positions[i * 3 + 2] = Math.random() * (maxZ - minZ) + minZ;
+          velocities[i * 3] = 0;
+          velocities[i * 3 + 1] = -(Math.random() * 0.1 + 0.1);
+          velocities[i * 3 + 2] = 0;
+        }
+        rainGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        rainGeometry.setAttribute("velocity", new THREE.BufferAttribute(velocities, 3));
+        const rainMaterial = new THREE.PointsMaterial({
+          color: 0x8888ff,
+          size: rainSettings.rainSize,
+          transparent: true,
+          opacity: 0.6,
+          map: createCircleTexture(),
+          alphaTest: 0.5
+        });
+        rainParticles = new THREE.Points(rainGeometry, rainMaterial);
+        scene.add(rainParticles);
+      }
+
+      function updateRain(delta) {
+        if (!rainParticles || !rainSettings.enabled) return;
+        const positions = rainParticles.geometry.attributes.position.array;
+        const velocities = rainParticles.geometry.attributes.velocity.array;
+        const count = positions.length / 3;
+        for (let i = 0; i < count; i++) {
+          positions[i * 3 + 1] += velocities[i * 3 + 1] * delta * 60 * rainSettings.rainSpeed;
+          const x = positions[i * 3];
+          const z = positions[i * 3 + 2];
+          const terrainY = sampleTerrainHeight(x, z);
+          if (positions[i * 3 + 1] < terrainY + 0.5) {
+            positions[i * 3 + 1] = terrainY + 50 + Math.random() * 50;
+          }
+        }
+        rainParticles.geometry.attributes.position.needsUpdate = true;
+      }
+
+      // -------------------- 控制面板（dat.GUI） --------------------
+      let gui, terrainFolder, objectFolder, regionFolder, plantFolder, rainFolder, soilFolder, regionController;
+      function createGUI() {
+        gui = new dat.GUI({ autoPlace: false });
+        document.body.appendChild(gui.domElement);
+        gui.domElement.style.position = "fixed";
+        gui.domElement.style.top = "60px";
+        gui.domElement.style.left = "10px";
+        gui.domElement.style.opacity = "0.8";
+        gui.domElement.style.background = "rgba(255,255,255,0.5)";
+
+        terrainFolder = gui.addFolder("地形控件");
+        terrainFolder.add(terrainControls, "scale", 0.01, 1, 0.01)
+          .name("垂直缩放")
+          .onChange(function(value){ updateTerrainGeometry(value); });
+        terrainFolder.addColor(terrainControls, "color")
+          .name("地形颜色")
+          .onChange(function(value){ terrainMesh.material.color.set(value); });
+        terrainFolder.open();
+
+        objectFolder = gui.addFolder("物体控件");
+        objectFolder.add(objectParams, "type", ["Random", "Sphere", "Box", "Cylinder", "Cone"])
+          .name("物体类型");
+        objectFolder.add(objectParams, "count", 1, 100, 1)
+          .name("物体数量")
+          .onChange(function(value){ maxNumObjects = value; });
+        objectFolder.add(objectParams, "size", 0.01, 1, 0.01).name("物体大小");
+        objectFolder.addColor(objectParams, "color").name("物体颜色");
+        objectFolder.add(objectParams, "cohesion", 0, 1, 0.01)
+          .name("物源凝聚力")
+          .onChange(function(value){ updateCohesionForObjects(); });
+        objectFolder.add({ addObjects: addObjectsRegion }, "addObjects").name("添加物源");
+        objectFolder.open();
+
+        regionFolder = gui.addFolder("区域控件");
+        regionFolder.add({ startDrawing: startDrawingRegion }, "startDrawing").name("新建区域");
+        regionController = regionFolder.add(regionControlData, "activeRegion", ["未选择"]).name("选择区域")
+          .onChange(function(value){
+            activeRegion = regions.find(r => r.name === value);
+            drawRegions();
+          });
+        regionFolder.open();
+
+        plantFolder = gui.addFolder("植物控件");
+        plantFolder.add(plantParams, "count", 1, 50, 1).name("植物数量");
+        plantFolder.addColor(plantParams, "color").name("植物颜色");
+        plantFolder.add(plantParams, "size", 0.5, 3, 0.1).name("植物大小");
+        plantFolder.add(plantParams, "height", 2, 10, 0.5).name("植物高度");
+        plantFolder.add(plantParams, "weight", 1, 20, 1).name("植物重量");
+        plantFolder.add({ addPlants: addPlantsRegion }, "addPlants").name("添加植物");
+        plantFolder.open();
+
+        rainFolder = gui.addFolder("降雨设置");
+        rainFolder.add(rainSettings, "enabled").name("启用降雨");
+        rainFolder.add(rainSettings, "rainSpeed", 0, 5, 0.1).name("降雨速度");
+        rainFolder.add(rainSettings, "rainCount", 1000, 20000, 1000).name("雨滴数量")
+          .onFinishChange(function(value){
+            scene.remove(rainParticles);
+            rainSettings.rainCount = value;
+            setupRain();
+          });
+        rainFolder.add(rainSettings, "rainSize", 0.1, 5, 0.1).name("雨滴大小")
+          .onChange(function(value){
+            if(rainParticles) {
+              rainParticles.material.size = value;
+            }
+          });
+        rainFolder.open();
+
+        soilFolder = gui.addFolder("土壤参数");
+        soilFolder.add(soilParams, "cohesion", 0, 10, 0.1).name("凝聚力").onChange(function(){ updateSoilForObjects(); });
+        soilFolder.add(soilParams, "adhesion", 0, 10, 0.1).name("附着力").onChange(function(){ updateSoilForObjects(); });
+        soilFolder.add(soilParams, "porePressure", 0, 10, 0.1).name("孔隙水压力").onChange(function(){ updateSoilForObjects(); });
+        soilFolder.open();
+      }
+
+      // 挂载全局函数，确保菜单中的 onclick 可调用
+      window.newProject = newProject;
+      window.chooseDEMData = chooseDEMData;
+      window.toggleGUISection = toggleGUISection;
+
+      function toggleGUISection(section) {
+        if(section==="terrain"){
+          terrainFolder.domElement.style.display = (terrainFolder.domElement.style.display==="none") ? "" : "none";
+        } else if(section==="object"){
+          objectFolder.domElement.style.display = (objectFolder.domElement.style.display==="none") ? "" : "none";
+        } else if(section==="region"){
+          regionFolder.domElement.style.display = (regionFolder.domElement.style.display==="none") ? "" : "none";
+        } else if(section==="plant"){
+          plantFolder.domElement.style.display = (plantFolder.domElement.style.display==="none") ? "" : "none";
+        } else if(section==="rain"){
+          rainFolder.domElement.style.display = (rainFolder.domElement.style.display==="none") ? "" : "none";
+        } else if(section==="soil"){
+          soilFolder.domElement.style.display = (soilFolder.domElement.style.display==="none") ? "" : "none";
+        }
+      }
+
+      // -------------------- 新建工程、加载/保存 JSON 功能 --------------------
+      async function newProject() {
+        try {
+          const dirHandle = await window.showDirectoryPicker();
+          window.currentProjectFolder = dirHandle;
+          alert("新工程创建成功！");
+          await loadRegionsData();
+          await loadObjectsData();
+          if(regionController && regionController.__select){
+            const select = regionController.__select;
+            while(select.firstChild){ select.removeChild(select.firstChild); }
+            regions.forEach(r => {
+              const option = document.createElement("option");
+              option.value = r.name;
+              option.textContent = r.name;
+              select.appendChild(option);
+            });
+            regionControlData.activeRegion = regions[0] ? regions[0].name : "未选择";
+            regionController.setValue(regionControlData.activeRegion);
+          }
+          restoreObjects();
+          drawRegions();
+        } catch(err){ console.error("新建工程出错：", err); }
+      }
+
+      async function saveRegionsData() {
+        if(!window.currentProjectFolder){ console.error("未选择项目文件夹"); return; }
+        try {
+          const fileHandle = await window.currentProjectFolder.getFileHandle("region.json", { create: true });
+          const writable = await fileHandle.createWritable();
+          const dataToSave = regions.map(r => ({
+            id: r.id,
+            name: r.name,
+            vertices: r.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))
+          }));
+          await writable.write(JSON.stringify(dataToSave, null, 2));
+          await writable.close();
+          console.log("区域数据已保存至 region.json");
+        } catch(err){ console.error("保存 region.json 出错：", err); }
+      }
+
+      async function loadRegionsData() {
+        if(!window.currentProjectFolder) return;
+        try {
+          const fileHandle = await window.currentProjectFolder.getFileHandle("region.json", { create: false });
+          const file = await fileHandle.getFile();
+          const text = await file.text();
+          const data = JSON.parse(text);
+          regions = [];
+          data.forEach(item => {
+            const vertices = item.vertices.map(v => new THREE.Vector3(v.x, v.y, v.z));
+            regions.push({ id: item.id, name: item.name, vertices: vertices });
+          });
+          if(regions.length>0){
+            activeRegion = regions[0];
+            regionControlData.activeRegion = regions[0].name;
+          }
+          console.log("加载区域数据：", regions);
+        } catch(err){ console.warn("未找到 region.json，可能尚未保存任何区域数据。"); }
+      }
+
+      async function saveObjectsData() {
+        if(!window.currentProjectFolder){ console.error("未选择项目文件夹"); return; }
+        try {
+          const fileHandle = await window.currentProjectFolder.getFileHandle("objects_region.json", { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(JSON.stringify(objectsData, null, 2));
+          await writable.close();
+          console.log("物体数据已保存至 objects_region.json");
+        } catch(err){ console.error("保存 objects_region.json 出错：", err); }
+      }
+
+      async function loadObjectsData() {
+        if(!window.currentProjectFolder) return;
+        try {
+          const fileHandle = await window.currentProjectFolder.getFileHandle("objects_region.json", { create: false });
+          const file = await fileHandle.getFile();
+          const text = await file.text();
+          objectsData = JSON.parse(text);
+          console.log("加载物体数据：", objectsData);
+        } catch(err){ console.warn("未找到 objects_region.json。"); }
+      }
+
+      async function chooseDEMData() {
+        try {
+          const [fileHandle] = await window.showOpenFilePicker({
+            multiple: false,
+            types: [{ description: "DEM 文件", accept: { "image/tiff": [".tif", ".tiff"] } }]
+          });
+          const file = await fileHandle.getFile();
+          const arrayBuffer = await file.arrayBuffer();
+          if(window.currentProjectFolder){
+            try {
+              const demFileHandle = await window.currentProjectFolder.getFileHandle("dem.tif", { create: true });
+              const writable = await demFileHandle.createWritable();
+              await writable.write(arrayBuffer);
+              await writable.close();
+              console.log("DEM数据已保存至项目文件夹：dem.tif");
+            } catch(err){ console.error("保存DEM数据时出错：", err); }
+          }
+          const georaster = await parseGeoraster(arrayBuffer);
+          console.log("加载选择的DEM数据成功：", georaster);
+          const demWidth = georaster.width, demHeight = georaster.height;
+          const values = georaster.values[0];
+          let minEl = Infinity, maxEl = -Infinity;
+          for(let r=0; r<demHeight; r++){
+            for(let c=0; c<demWidth; c++){
+              const v = values[r][c];
+              if(v===georaster.noDataValue) continue;
+              if(v<minEl) minEl = v;
+              if(v>maxEl) maxEl = v;
+            }
+          }
+          const amplitude = 200;
+          const heightDataArray = new Float32Array(demWidth*demHeight);
+          for(let r=0; r<demHeight; r++){
+            for(let c=0; c<demWidth; c++){
+              const v = values[r][c];
+              let normalized = (v===georaster.noDataValue || maxEl===minEl) ? 0 : (v-minEl)/(maxEl-minEl);
+              heightDataArray[r*demWidth+c] = normalized*amplitude - amplitude/2;
+            }
+          }
+          terrainWidth = demWidth;
+          terrainDepth = demHeight;
+          heightData = heightDataArray;
+          terrainMinHeight = -amplitude/2;
+          terrainMaxHeight = amplitude;
+          terrainHalfWidth = terrainWidth/2;
+          terrainHalfDepth = terrainDepth/2;
+          updateTerrainGeometry(terrainControls.scale);
+          updateTerrainPhysics(terrainControls.scale);
+          alert("DEM数据已更新！");
+        } catch(err){
+          console.error("选择DEM数据出错：", err);
+          alert("选择DEM数据时出错，请重试！");
+        }
+      }
+
+      // -------------------- 动画循环 --------------------
+      function animate() {
+        const deltaTime = clock.getDelta();
+        render(deltaTime);
+        stats.update();
+      }
+
+      function render(delta) {
+        physicsWorld.stepSimulation(delta, 10);
+        for(let i=0, il=dynamicObjects.length; i<il; i++){
+          const obj = dynamicObjects[i];
+          const ms = obj.userData.physicsBody.getMotionState();
+          if(ms){
+            ms.getWorldTransform(transformAux1);
+            const p = transformAux1.getOrigin();
+            const q = transformAux1.getRotation();
+            obj.position.set(p.x(), p.y(), p.z());
+            obj.quaternion.set(q.x(), q.y(), q.z(), q.w());
+          }
+        }
+        if(rainSettings.enabled) {
+          updateRain(delta);
+        }
+        renderer.render(scene, camera);
+      }
+
+    </script>
+  </body>
+</html>

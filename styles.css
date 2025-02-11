@@ -1,0 +1,92 @@
+body {
+  margin: 0;
+  overflow: hidden;
+  font-family: sans-serif;
+}
+/* 顶部标题栏和菜单栏（始终显示在最上层） */
+#header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  z-index: 10000;
+}
+#header h1 {
+  margin: 0;
+  font-size: 18px;
+  flex: 1;
+}
+.navbar {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+}
+.menu {
+  position: relative;
+}
+.menu > button {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+}
+/* 子菜单下拉列表 */
+.dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: rgba(50, 50, 50, 0.95);
+  min-width: 150px;
+  display: none;
+  flex-direction: column;
+  z-index: 10001;
+}
+.menu:hover .dropdown {
+  display: flex;
+}
+.dropdown button {
+  background: none;
+  border: none;
+  color: #fff;
+  padding: 8px 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.dropdown button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+/* 区域绘制提示 */
+#drawMessage {
+  position: absolute;
+  top: 50px;
+  left: 10px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 16px;
+  border-radius: 4px;
+  display: none;
+  z-index: 10001;
+}
+/* 主场景容器 */
+#container {
+  margin-top: 50px;
+  width: 100%;
+  height: calc(100vh - 50px);
+}
+/* dat.GUI 控件区域固定在页面左侧 */
+.dg.main {
+  position: fixed !important;
+  top: 60px !important;
+  left: 10px !important;
+  opacity: 0.8 !important;
+  background: rgba(255, 255, 255, 0.5) !important;
+  z-index: 100;
+}

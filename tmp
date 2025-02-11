@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>GPU 计算降雨，具有可调地形和土块模拟</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="main.css">
+  </head>
+  <body>
+    <div id="info">
+      <a href="" target="_blank" rel="noopener">GPU 计算降雨，具有可调地形和土块模拟</a>
+      
+    </div>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "../threejs/build/three.webgpu.js",
+        "three/webgpu": "../threejs/build/three.webgpu.js",
+        "three/tsl": "../threejs/build/three.tsl.js",
+        "three/addons/": "../threejs/examples/jsm/"
+      }
+    }
+    </script>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import {
+        Fn, texture, uv, uint, instancedArray, positionWorld, billboarding,
+        time, hash, deltaTime, vec2, instanceIndex, positionGeometry, If, uniform
+      } from 'three/tsl';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+      import Stats from 'three/addons/libs/stats.module.js';
+      import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+      import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+      import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
+
+      //────────────────────────────────────────────
+      // 全局变量声明
+      //────────────────────────────────────────────
+      let camera, scene, renderer;
+      let controls, stats;
+      let computeParticles;
+      let clock;
+      let collisionCamera, collisionPosRT, collisionPosMaterial;
+      // (原 collisionBox 已去掉，用土层替代)
+
+      // 雨滴复位高度及其 uniform 节点（用于 GPU 计算中）
+      let rainResetHeight = 25;
+      let rainResetHeightUniform = uniform(rainResetHeight);
+
+      //────────────────────────────────────────────
+      // Terrain 参数（默认设定为：Noise Scale=85, Noise Amplitude=2.7, Octaves=3,
+      // Min Height=-10, Max Height=10, Slope Multiplier=0.1, Terrain Offset=10, Seed=69）
+      //────────────────────────────────────────────
+      const paramsTerrain = {
+        noiseScale: 85,
+        noiseAmplitude: 2.7,
+        octaves: 3,
+        desiredMin: -10,
+        desiredMax: 10,
+        slopeMultiplier: 0.1,
+        terrainOffset: 10,
+        seed: 69
+      };
+
+      let terrainMaxHeight = 0;
+      function updateRainResetHeight() {
+        const offset = 5;
+        rainResetHeight = terrainMaxHeight + offset;
+        rainResetHeightUniform.value = rainResetHeight;
+      }
+
+      //────────────────────────────────────────────
+      // 更新 terrainGeometry（修改 Y 坐标，并计算 terrainMaxHeight）
+      //────────────────────────────────────────────
+      let terrainMesh, terrainGeometry, terrainMaterial;
+      function updateTerrainGeometry() {
+        const terrainWidthSegments = 256, terrainDepthSegments = 256;
+        const size = terrainWidthSegments * terrainDepthSegments;
+        const data = new Float32Array(size);
+        const perlin = new ImprovedNoise();
+        let frequency = paramsTerrain.noiseScale;
+        let amplitude = paramsTerrain.noiseAmplitude;
+        for (let o = 0; o < paramsTerrain.octaves; o++) {
+          for (let i = 0; i < size; i++) {
+            const x = i % terrainWidthSegments;
+            const y = Math.floor(i / terrainWidthSegments);
+            data[i] += perlin.noise(x / frequency, y / frequency, paramsTerrain.seed) * amplitude;
+          }
+          frequency *= 2;
+          amplitude *= 0.5;
+        }
+        let currentMin = Infinity, currentMax = -Infinity;
+        for (let i = 0; i < size; i++) {
+          if (data[i] < currentMin) currentMin = data[i];
+          if (data[i] > currentMax) currentMax = data[i];
+        }
+        for (let i = 0; i < size; i++) {
+          data[i] = paramsTerrain.desiredMin + (data[i] - currentMin) / (currentMax - currentMin) * (paramsTerrain.desiredMax - paramsTerrain.desiredMin);
+        }
+        const positions = terrainGeometry.attributes.position;
+        for (let i = 0; i < positions.count; i++) {
+          const posX = positions.getX(i);
+          const posZ = positions.getZ(i);
+          const ix = i % terrainWidthSegments;
+          const iz = Math.floor(i / terrainWidthSegments);
+          const dataIndex = iz * terrainWidthSegments + ix;
+          const h = data[dataIndex];
+          const slopeOffset = (-posX + posZ) * paramsTerrain.slopeMultiplier;
+          positions.setY(i, h + slopeOffset + paramsTerrain.terrainOffset);
+        }
+        positions.needsUpdate = true;
+        terrainGeometry.computeVertexNormals();
+        let maxHeight = -Infinity;
+        const posArray = positions.array;
+        for (let i = 1; i < posArray.length; i += 3) {
+          if (posArray[i] > maxHeight) maxHeight = posArray[i];
+        }
+        terrainMaxHeight = maxHeight;
+        updateRainResetHeight();
+      }
+
+      //────────────────────────────────────────────
+      // 土层（Soil Block）模拟
+      // 利用在单位球内均匀采样生成400个粒子，形成一个随机聚集的土层，
+      // 通过 group.scale 调整为指定尺寸（基准尺寸：宽30、高10、深15）。
+      // 同时粒子尺寸设为2.0以便观察。
+      //────────────────────────────────────────────
+      let soilBlock;
+      // 新增土层参数（包括水平尺度和垂直厚度调节因子）
+      const soilBlockParams = {
+        color: "#ff8800",       // 干燥时橙色
+        multicolor: false,      
+        posX: 0,
+        posZ: 0,
+        horizontalScale: 1.0,   // 默认水平尺度
+        verticalScale: 1.0      // 默认垂直厚度调节因子
+      };
+
+      // 更新土层规模：水平尺度决定横向尺寸，垂直尺度按公式vertical = clamp(2/horizontalScale,0.3,2)再乘以 verticalScale因子
+      function updateSoilBlockScale() {
+        const hor = soilBlockParams.horizontalScale;
+        const baseX = 15, baseY = 5, baseZ = 7.5;
+        const verBase = THREE.MathUtils.clamp(2.0 / hor, 0.3, 2);
+        if (soilBlock && soilBlock.group) {
+          soilBlock.group.scale.set(hor * baseX, verBase * soilBlockParams.verticalScale * baseY, hor * baseZ);
+        }
+      }
+
+      function createSoilBlock() {
+        const total = 400;
+        const positions = new Float32Array(total * 3);
+        for (let i = 0; i < total; i++) {
+          const u = Math.random();
+          const v = Math.random();
+          const w = Math.random();
+          const r = Math.cbrt(w);  // 均匀体积分布
+          const theta = Math.acos(2 * u - 1);
+          const phi = 2 * Math.PI * v;
+          const x = r * Math.sin(theta) * Math.cos(phi);
+          const y = r * Math.sin(theta) * Math.sin(phi);
+          const z = r * Math.cos(theta);
+          positions[i * 3] = x;
+          positions[i * 3 + 1] = y;
+          positions[i * 3 + 2] = z;
+        }
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        // 将粒子尺寸调大，以便观察
+        const material = new THREE.PointsMaterial({ color: new THREE.Color(soilBlockParams.color), size: 10.0 });
+        if (soilBlockParams.multicolor) {
+          material.vertexColors = true;
+        }
+        const points = new THREE.Points(geometry, material);
+        const group = new THREE.Group();
+        group.add(points);
+        // 初始位置（X,Z由参数控制，Y稍后由附着函数更新）
+        group.position.set(soilBlockParams.posX, 0, soilBlockParams.posZ);
+        const block = {
+          group: group,
+          points: points,
+          state: 'attached',  // 初始固着
+          waterContent: 0,
+          friction: 1.0,
+          velocity: new THREE.Vector3(),
+          waterThreshold: 100
+        };
+        soilBlock = block;
+        updateSoilBlockScale();
+        return block;
+      }
+
+      //────────────────────────────────────────────
+      // 使土层附着于 terrain：利用土层 group 的 X/Z 坐标向下射线检测 terrain，更新其 Y 坐标
+      //────────────────────────────────────────────
+      function updateSoilBlockAttachment() {
+        if (!terrainMesh || !soilBlock) return;
+        const pos = soilBlock.group.position;
+        const rayOrigin = new THREE.Vector3(pos.x, 100, pos.z);
+        const rayDir = new THREE.Vector3(0, -1, 0);
+        const raycaster2 = new THREE.Raycaster(rayOrigin, rayDir);
+        const intersects = raycaster2.intersectObject(terrainMesh);
+        if (intersects.length > 0) {
+          // 可加偏移使土层底部略高于 terrain
+          soilBlock.group.position.y = intersects[0].point.y;
+        }
+      }
+
+      function updateSoilBlockMaterial() {
+        const pts = soilBlock.points;
+        pts.material.vertexColors = false;
+        pts.material.color.set(soilBlockParams.color);
+        pts.material.needsUpdate = true;
+      }
+
+      //────────────────────────────────────────────
+      // 视角控制参数及预设（保持原有设置）
+      //────────────────────────────────────────────
+      const viewParams = {
+        locked: true,
+        preset: "Southeast"
+      };
+      function updateCameraPreset() {
+        switch(viewParams.preset) {
+          case "Southeast":
+            camera.position.set(50, 70, 50);
+            break;
+          case "Front":
+            camera.position.set(0, 70, 50);
+            break;
+          case "Back":
+            camera.position.set(0, 70, -50);
+            break;
+          case "Left":
+            camera.position.set(-50, 70, 0);
+            break;
+          case "Right":
+            camera.position.set(50, 70, 0);
+            break;
+          case "Top":
+            camera.position.set(0, 100, 0.01);
+            break;
+          default:
+            camera.position.set(50, 70, 50);
+        }
+        camera.lookAt(0, 0, 0);
+        controls.update();
+      }
+
+      //────────────────────────────────────────────
+      // 主入口函数 init()
+      //────────────────────────────────────────────
+      init();
+      function init() {
+        const { innerWidth, innerHeight } = window;
+        camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 110);
+        camera.position.set(40, 8, 0);
+        camera.lookAt(0, 0, 0);
+
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x78909C);
+
+        //────────────────────────────────────────────
+        // 环境光与方向光
+        //────────────────────────────────────────────
+        const ambientLight = new THREE.AmbientLight(0x404040, 1.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.castShadow = true;
+        dirLight.position.set(3, 17, 17);
+        dirLight.shadow.camera.near = 1;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.right = 25;
+        dirLight.shadow.camera.left = -25;
+        dirLight.shadow.camera.top = 25;
+        dirLight.shadow.camera.bottom = -25;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.bias = -0.01;
+        scene.add(dirLight);
+
+        //────────────────────────────────────────────
+        // 添加背景平面（flatPlane）
+        //────────────────────────────────────────────
+        const flatPlaneGeometry = new THREE.PlaneGeometry(100, 100);
+        flatPlaneGeometry.rotateX(-Math.PI / 2);
+        const flatPlaneMaterial = new THREE.MeshPhongMaterial({ color: 0x050505 });
+        const flatPlane = new THREE.Mesh(flatPlaneGeometry, flatPlaneMaterial);
+        flatPlane.receiveShadow = true;
+        scene.add(flatPlane);
+
+        //────────────────────────────────────────────
+        // collision 相关设置（采 layer 1），用于雨滴落地采样（现只渲染 terrain）
+        //────────────────────────────────────────────
+        collisionCamera = new THREE.OrthographicCamera(-50, 50, 50, -50, 0.1, 50);
+        collisionCamera.position.y = 50;
+        collisionCamera.lookAt(0, 0, 0);
+        collisionCamera.layers.disableAll();
+        collisionCamera.layers.enable(1);
+
+        collisionPosRT = new THREE.WebGLRenderTarget(1024, 1024);
+        collisionPosRT.texture.type = THREE.HalfFloatType;
+        collisionPosRT.texture.magFilter = THREE.NearestFilter;
+        collisionPosRT.texture.minFilter = THREE.NearestFilter;
+        collisionPosRT.texture.generateMipmaps = false;
+
+        collisionPosMaterial = new THREE.MeshBasicNodeMaterial();
+        collisionPosMaterial.colorNode = positionWorld;
+
+        //────────────────────────────────────────────
+        // 初始化降雨粒子（GPU Compute 部分）
+        //────────────────────────────────────────────
+        const maxParticleCount = 50000;
+        const instanceCount = maxParticleCount / 2;
+        const positionBuffer = instancedArray(maxParticleCount, 'vec3');
+        const velocityBuffer = instancedArray(maxParticleCount, 'vec3');
+        const ripplePositionBuffer = instancedArray(maxParticleCount, 'vec3');
+        const rippleTimeBuffer = instancedArray(maxParticleCount, 'vec3');
+        const randUint = () => uint(Math.random() * 0xFFFFFF);
+        const computeInit = Fn(() => {
+          const position = positionBuffer.element(instanceIndex);
+          const velocity = velocityBuffer.element(instanceIndex);
+          const rippleTime = rippleTimeBuffer.element(instanceIndex);
+          const randX = hash(instanceIndex);
+          const randY = hash(instanceIndex.add(randUint()));
+          const randZ = hash(instanceIndex.add(randUint()));
+          position.x = randX.mul(100).add(-50);
+          position.y = rainResetHeightUniform.add(randY.mul(10));
+          position.z = randZ.mul(100).add(-50);
+          velocity.y = randX.mul(-0.04).add(-0.2);
+          rippleTime.x = 1000;
+        })().compute(maxParticleCount);
+        const computeUpdate = Fn(() => {
+          const getCoord = (pos) => pos.add(50).div(100);
+          const position = positionBuffer.element(instanceIndex);
+          const velocity = velocityBuffer.element(instanceIndex);
+          const ripplePosition = ripplePositionBuffer.element(instanceIndex);
+          const rippleTime = rippleTimeBuffer.element(instanceIndex);
+          position.addAssign(velocity);
+          rippleTime.x = rippleTime.x.add(deltaTime.mul(4));
+          const collisionArea = texture(collisionPosRT.texture, getCoord(position.xz));
+          const surfaceOffset = 0.05;
+          const floorPosition = collisionArea.y.add(surfaceOffset);
+          const ripplePivotOffsetY = -0.9;
+          If(position.y.add(ripplePivotOffsetY).lessThan(floorPosition), () => {
+            position.y = rainResetHeightUniform;
+            ripplePosition.xz = position.xz;
+            ripplePosition.y = floorPosition;
+            rippleTime.x = 1;
+            position.x = hash(instanceIndex.add(time)).mul(100).add(-50);
+            position.z = hash(instanceIndex.add(time.add(randUint()))).mul(100).add(-50);
+          });
+          const rippleOnSurface = texture(collisionPosRT.texture, getCoord(ripplePosition.xz));
+          const rippleFloorArea = rippleOnSurface.y.add(surfaceOffset);
+          If(ripplePosition.y.greaterThan(rippleFloorArea), () => {
+            rippleTime.x = 1000;
+          });
+        })();
+        computeParticles = computeUpdate.compute(maxParticleCount);
+
+        //────────────────────────────────────────────
+        // 降雨粒子渲染
+        //────────────────────────────────────────────
+        const rainMaterial = new THREE.MeshBasicNodeMaterial();
+        rainMaterial.colorNode = uv().distance(vec2(0.5, 0)).oneMinus().mul(3).exp().mul(0.1);
+        rainMaterial.vertexNode = billboarding({ position: positionBuffer.toAttribute() });
+        rainMaterial.opacity = 0.2;
+        rainMaterial.side = THREE.DoubleSide;
+        rainMaterial.forceSinglePass = true;
+        rainMaterial.depthWrite = false;
+        rainMaterial.depthTest = true;
+        rainMaterial.transparent = true;
+        const rainParticles = new THREE.Mesh(new THREE.PlaneGeometry(0.1, 2), rainMaterial);
+        rainParticles.count = instanceCount;
+        scene.add(rainParticles);
+
+        //────────────────────────────────────────────
+        // 涟漪效果
+        //────────────────────────────────────────────
+        const rippleTime = rippleTimeBuffer.element(instanceIndex).x;
+        const rippleEffect = Fn(() => {
+          const center = uv().add(vec2(-0.5)).length().mul(7);
+          const distance = rippleTime.sub(center);
+          return distance.min(1).sub(distance.max(1).sub(1));
+        });
+        const rippleMaterial = new THREE.MeshBasicNodeMaterial();
+        rippleMaterial.colorNode = rippleEffect();
+        rippleMaterial.positionNode = positionGeometry.add(ripplePositionBuffer.toAttribute());
+        rippleMaterial.opacityNode = rippleTime.mul(0.3).oneMinus().max(0).mul(0.5);
+        rippleMaterial.side = THREE.DoubleSide;
+        rippleMaterial.forceSinglePass = true;
+        rippleMaterial.depthWrite = false;
+        rippleMaterial.depthTest = true;
+        rippleMaterial.transparent = true;
+        const surfaceRippleGeometry = new THREE.PlaneGeometry(2.5, 2.5);
+        surfaceRippleGeometry.rotateX(-Math.PI / 2);
+        const xRippleGeometry = new THREE.PlaneGeometry(1, 2);
+        xRippleGeometry.rotateY(-Math.PI / 2);
+        const zRippleGeometry = new THREE.PlaneGeometry(1, 2);
+        const rippleGeometry = BufferGeometryUtils.mergeGeometries([surfaceRippleGeometry, xRippleGeometry, zRippleGeometry]);
+        const rippleParticles = new THREE.Mesh(rippleGeometry, rippleMaterial);
+        rippleParticles.count = instanceCount;
+        scene.add(rippleParticles);
+
+        //────────────────────────────────────────────
+        // Terrain 地形 —— 生成 terrain，并放置于背景平面之上
+        //────────────────────────────────────────────
+        const terrainWidth = 100, terrainDepth = 100;
+        terrainGeometry = new THREE.PlaneGeometry(terrainWidth, terrainDepth, 256 - 1, 256 - 1);
+        terrainGeometry.rotateX(-Math.PI / 2);
+        const textureTerrain = (() => {
+          const canvas = document.createElement('canvas');
+          canvas.width = 256;
+          canvas.height = 256;
+          const context = canvas.getContext('2d');
+          context.fillStyle = '#000';
+          context.fillRect(0, 0, 256, 256);
+          const image = context.getImageData(0, 0, 256, 256);
+          const imageData = image.data;
+          const baseR = 76, baseG = 175, baseB = 80;
+          const sun = new THREE.Vector3(1, 1, 1).normalize();
+          const vector3 = new THREE.Vector3();
+          for (let i = 0, len = imageData.length; i < len; i += 4) {
+            vector3.set(0, 1, 0);
+            const shade = 0.7 + 0.3 * vector3.dot(sun);
+            imageData[i]     = baseR * shade;
+            imageData[i + 1] = baseG * shade;
+            imageData[i + 2] = baseB * shade;
+            imageData[i + 3] = 255;
+          }
+          context.putImageData(image, 0, 0);
+          const tex = new THREE.CanvasTexture(canvas);
+          tex.wrapS = THREE.ClampToEdgeWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          return tex;
+        })();
+        terrainMaterial = new THREE.MeshPhongMaterial({
+          map: textureTerrain,
+          color: 0x4CAF50,
+          side: THREE.DoubleSide
+        });
+        terrainMesh = new THREE.Mesh(terrainGeometry, terrainMaterial);
+        terrainMesh.receiveShadow = true;
+        terrainMesh.castShadow = false;
+        terrainMesh.layers.enable(1);
+        scene.add(terrainMesh);
+        updateTerrainGeometry();
+
+        //────────────────────────────────────────────
+        // 创建土层（soil block）—— 使用随机采样形成粒状土层，并自动附着于 terrain
+        soilBlock = createSoilBlock();
+        scene.add(soilBlock.group);
+        // 添加 BoxHelper 用于显示土层边界
+        var soilBlockHelper = new THREE.BoxHelper(soilBlock.group, 0xffff00);
+        scene.add(soilBlockHelper);
+
+        //────────────────────────────────────────────
+        // 初始化渲染器及相关控制
+        //────────────────────────────────────────────
+        clock = new THREE.Clock();
+        renderer = new THREE.WebGPURenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.setAnimationLoop(animate);
+        document.body.appendChild(renderer.domElement);
+        stats = new Stats();
+        document.body.appendChild(stats.dom);
+
+        // ★ terrain 更新后雨滴复位高度已更新，这里重新初始化雨滴粒子位置
+        renderer.computeAsync(computeInit);
+
+        controls = new OrbitControls(camera, renderer.domElement);
+        controls.minDistance = 5;
+        controls.maxDistance = 50;
+        controls.update();
+
+        window.addEventListener('resize', onWindowResize);
+        window.addEventListener('mousedown', onMouseDown, false);
+        
+        //────────────────────────────────────────────
+        // GUI 控制面板
+        //────────────────────────────────────────────
+        const gui = new GUI();
+        gui.add(rainParticles, 'count', 200, maxParticleCount, 1)
+          .name('drop count')
+          .onChange((v) => {
+            rippleParticles.count = v;
+          });
+        const lightParams = {
+          ambientIntensity: ambientLight.intensity,
+          ambientColor: ambientLight.color.getHex(),
+          directionalIntensity: dirLight.intensity,
+          directionalColor: dirLight.color.getHex()
+        };
+        const lightFolder = gui.addFolder('Light Settings');
+        lightFolder.add(lightParams, 'ambientIntensity', 0, 2).step(0.01)
+          .name('Ambient Intensity')
+          .onChange(v => { ambientLight.intensity = v; });
+        lightFolder.addColor(lightParams, 'ambientColor')
+          .name('Ambient Color')
+          .onChange(v => { ambientLight.color.set(v); });
+        lightFolder.add(lightParams, 'directionalIntensity', 0, 2).step(0.01)
+          .name('Directional Intensity')
+          .onChange(v => { dirLight.intensity = v; });
+        lightFolder.addColor(lightParams, 'directionalColor')
+          .name('Directional Color')
+          .onChange(v => { dirLight.color.set(v); });
+        const materialParams = {
+          terrainColor: terrainMaterial.color.getHex()
+        };
+        const materialFolder = gui.addFolder('Material Colors');
+        materialFolder.addColor(materialParams, 'terrainColor')
+          .name('Terrain Color')
+          .onChange(v => { terrainMaterial.color.set(v); });
+        const terrainFolder = gui.addFolder("Terrain Settings");
+        terrainFolder.add(paramsTerrain, 'noiseScale', 10, 150).step(1)
+          .name("Noise Scale")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'noiseAmplitude', 0.1, 5).step(0.1)
+          .name("Noise Amplitude")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'octaves', 1, 8).step(1)
+          .name("Octaves")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'desiredMin', -10, 0).step(0.1)
+          .name("Min Height")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'desiredMax', 0, 10).step(0.1)
+          .name("Max Height")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'slopeMultiplier', 0, 0.1).step(0.001)
+          .name("Slope Multiplier")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'terrainOffset', 0, 10).step(0.1)
+          .name("Terrain Offset")
+          .onChange(updateTerrainGeometry);
+        terrainFolder.add(paramsTerrain, 'seed', 0, 100).step(1)
+          .name("Seed")
+          .onChange(updateTerrainGeometry);
+          
+        const soilFolder = gui.addFolder("Soil Block Settings");
+        soilFolder.add({ posX: soilBlock.group.position.x }, "posX", -50, 50).name("X Position").onChange(val => {
+          soilBlock.group.position.x = val;
+          updateSoilBlockAttachment();
+        });
+        soilFolder.add({ posZ: soilBlock.group.position.z }, "posZ", -50, 50).name("Z Position").onChange(val => {
+          soilBlock.group.position.z = val;
+          updateSoilBlockAttachment();
+        });
+        soilFolder.add({ horizontalScale: soilBlock.group.scale.x / 15 }, "horizontalScale", 0.5, 3, 0.01)
+          .name("Horizontal Scale")
+          .onChange(val => {
+            soilBlockParams.horizontalScale = val;
+            updateSoilBlockScale();
+          });
+        soilFolder.add({ verticalScale: soilBlockParams.verticalScale }, "verticalScale", 0.3, 2, 0.01)
+          .name("Vertical Scale")
+          .onChange(val => {
+            soilBlockParams.verticalScale = val;
+            updateSoilBlockScale();
+          });
+        soilFolder.addColor({ color: soilBlock.points.material.color.getHex() }, "color")
+          .name("Soil Color")
+          .onChange(val => {
+            soilBlock.points.material.color.set(val);
+            soilBlock.points.material.needsUpdate = true;
+          });
+        soilFolder.add({ multicolor: false }, "multicolor").name("Multicolor").onChange(val => {
+          soilBlockParams.multicolor = val;
+          soilBlock.points.material.vertexColors = val;
+          updateSoilBlockMaterial();
+        });
+      }
+
+      function onWindowResize() {
+        const { innerWidth, innerHeight } = window;
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      }
+
+      //────────────────────────────────────────────
+      // 鼠标点击事件 —— 本例加载后土层即自动附着，可保留调试用
+      //────────────────────────────────────────────
+      function onMouseDown(event) {
+        event.preventDefault();
+        const mouse = new THREE.Vector2();
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(soilBlock.points, true);
+        if (intersects.length > 0) {
+          soilBlock.selected = true;
+          soilBlock.state = 'attached';
+          const terrainRaycaster = new THREE.Raycaster();
+          terrainRaycaster.set(new THREE.Vector3(soilBlock.group.position.x, 100, soilBlock.group.position.z), new THREE.Vector3(0, -1, 0));
+          const terrainIntersects = terrainRaycaster.intersectObject(terrainMesh);
+          if (terrainIntersects.length > 0) {
+            const intersectPoint = terrainIntersects[0].point;
+            soilBlock.group.position.y = intersectPoint.y;
+          }
+        }
+      }
+
+      //────────────────────────────────────────────
+      // animate：每帧更新——包括降雨与土层行为模拟
+      //────────────────────────────────────────────
+      function animate() {
+        stats.update();
+        const delta = clock.getDelta();
+
+        // Collision pass：将 terrain 渲染至 collisionPosRT 用于雨滴碰撞检测
+        scene.overrideMaterial = collisionPosMaterial;
+        renderer.setRenderTarget(collisionPosRT);
+        renderer.render(scene, collisionCamera);
+        renderer.compute(computeParticles);
+        scene.overrideMaterial = null;
+        renderer.setRenderTarget(null);
+        renderer.render(scene, camera);
+
+        // 土层行为模拟
+        if (soilBlock) {
+          // 持续更新土层附着（自动更新 Y 坐标）
+          updateSoilBlockAttachment();
+
+          if (soilBlock.state === 'attached') {
+            // 模拟雨水吸收：水分增加、降低粘合力、更新颜色
+            soilBlock.waterContent += delta * 5;
+            let waterFactor = THREE.MathUtils.clamp(soilBlock.waterContent / soilBlock.waterThreshold, 0, 1);
+            soilBlock.friction = THREE.MathUtils.clamp(1.0 - waterFactor, 0.1, 1.0);
+            const dryColor = new THREE.Color(0xff8800);
+            const wetColor = new THREE.Color(0x4B3621);
+            soilBlock.points.material.color.copy(dryColor).lerp(wetColor, waterFactor);
+            soilBlock.points.material.needsUpdate = true;
+
+            // 检测 terrain 坡面，用以判断是否进入滑坡状态
+            const terrainRaycaster = new THREE.Raycaster(new THREE.Vector3(soilBlock.group.position.x, 100, soilBlock.group.position.z),
+                                                            new THREE.Vector3(0, -1, 0));
+            const terrainIntersects = terrainRaycaster.intersectObject(terrainMesh);
+            if (terrainIntersects.length > 0) {
+              const intersect = terrainIntersects[0];
+              const normal = intersect.face.normal.clone().transformDirection(terrainMesh.matrixWorld);
+              const angle = Math.acos(normal.dot(new THREE.Vector3(0, 1, 0)));
+              if (angle > THREE.Math.degToRad(30) && soilBlock.friction < 0.3) {
+                soilBlock.state = 'sliding';
+              }
+            }
+          } else if (soilBlock.state === 'sliding') {
+            const terrainRaycaster = new THREE.Raycaster(new THREE.Vector3(soilBlock.group.position.x, 100, soilBlock.group.position.z),
+                                                            new THREE.Vector3(0, -1, 0));
+            const terrainIntersects = terrainRaycaster.intersectObject(terrainMesh);
+            if (terrainIntersects.length > 0) {
+              const intersect = terrainIntersects[0];
+              let normal = intersect.face.normal.clone().transformDirection(terrainMesh.matrixWorld);
+              let downhill = new THREE.Vector3(0, -1, 0).projectOnPlane(normal).normalize();
+              const g = 9.8;
+              let acceleration = downhill.multiplyScalar(g * (1 - soilBlock.friction));
+              soilBlock.velocity.add(acceleration.multiplyScalar(delta));
+              soilBlock.velocity.multiplyScalar(0.99);
+              soilBlock.group.position.add(soilBlock.velocity.clone().multiplyScalar(delta));
+              updateSoilBlockAttachment();
+            }
+          }
+          soilBlockHelper.update();
+        }
+      }
+    </script>
+  </body>
+</html>
